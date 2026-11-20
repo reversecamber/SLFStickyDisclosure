@@ -10,15 +10,14 @@ and turning a drop into a new section order.
 
 ## Add it to an app
 
-The package has no remote yet. Check it out next to the app's repository and depend on it by path:
-
 ```swift
-.package(path: "../../SectionedListUI"),  // adjust to where Package.swift sits
+.package(url: "https://github.com/reversecamber/SLFStickyDisclosure", exact: "0.1.0"),
 ...
-.product(name: "SectionedListUI", package: "SectionedListUI"),
+.product(name: "SectionedListUI", package: "SLFStickyDisclosure"),
 ```
 
-Once it has a remote, switch to `.package(url:exact:)`.
+The repository is named SLFStickyDisclosure, so that is the `package:` name. The library and module are
+named SectionedListUI, so code uses `import SectionedListUI`.
 
 Public types are named `SectionedList…` without an app prefix. The module name scopes them, so apps
 adopting the package treat it as exempt from their own `AppPrefix.md` rule.
