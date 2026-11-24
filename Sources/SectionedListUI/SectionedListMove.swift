@@ -45,10 +45,44 @@ public struct SectionedListMove<ID: Hashable & Sendable>: Equatable, Sendable {
     }
 }
 
-/// A change in whether sections are being dragged.
-public enum SectionedListDragEvent<ID: Hashable & Sendable>: Equatable, Sendable {
-    /// A drag lifted these sections. While a drag is active, every section's rows are hidden.
-    case began([ID])
-    /// The drag ended with a drop or a cancel. An accepted drop also arrives separately as a ``SectionedListMove``.
-    case ended
+/// A request to move one row, within its section or into another section, reported after a drop
+/// or a VoiceOver move action.
+public struct SectionedListRowMove<SectionID: Hashable & Sendable, RowID: Hashable & Sendable>: Equatable, Sendable {
+    /// Where the row goes in the target section, judged after the row is taken out.
+    public enum Destination: Equatable, Sendable {
+        /// Immediately before the row with this ID.
+        case before(RowID)
+        /// After the last row.
+        case end
+    }
+
+    public let row: RowID
+    public let fromSection: SectionID
+    public let toSection: SectionID
+    public let destination: Destination
+
+    public init(row: RowID, fromSection: SectionID, toSection: SectionID, destination: Destination) {
+        self.row = row
+        self.fromSection = fromSection
+        self.toSection = toSection
+        self.destination = destination
+    }
+
+    /// Returns the target section's row IDs with the moved row placed at the destination.
+    ///
+    /// Pass the target section's current row IDs in order; the moved row may be among them when the
+    /// move stays within its section. Returns `nil` when the destination row is missing or the
+    /// order doesn't change.
+    public func reordered(_ targetRowIDs: [RowID]) -> [RowID]? {
+        var reordered = targetRowIDs.filter { $0 != row }
+        switch destination {
+        case let .before(target):
+            guard let index = reordered.firstIndex(of: target) else { return nil }
+            reordered.insert(row, at: index)
+        case .end:
+            reordered.append(row)
+        }
+        guard reordered != targetRowIDs else { return nil }
+        return reordered
+    }
 }
