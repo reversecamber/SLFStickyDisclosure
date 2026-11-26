@@ -35,6 +35,9 @@ where SectionModel.ID: Sendable, Item.ID: Sendable {
 
     @State private var geometry = SectionedListGeometry<SectionID, RowID>()
     @State private var drag: SectionedListDrag<SectionID, RowID>?
+    /// A move the list requested whose result the caller's data doesn't show yet. See ``request(_:)``.
+    @State private var pending: SectionedListPendingMove<SectionID, RowID>?
+    @State private var pendingTimeout: Task<Void, Never>?
     @State private var liftCount = 0
     @State private var targetCount = 0
 
@@ -136,13 +139,14 @@ where SectionModel.ID: Sendable, Item.ID: Sendable {
         .overlay(alignment: .topLeading) { floatingView }
         .sensoryFeedback(.impact(weight: .medium), trigger: liftCount)
         .sensoryFeedback(.selection, trigger: targetCount)
+        .onChange(of: dataSnapshot) { dataChanged() }
     }
 
     // MARK: Display
 
     /// Sections in the order shown: during a section drag, the dragged section sits at its target.
     private var displaySections: [SectionModel] {
-        guard let drag, case .section = drag.item else { return sections }
+        guard let drag, case .section = drag.item else { return arrangedSections }
         let byID = Dictionary(sections.map { ($0.id, $0) }, uniquingKeysWith: { first, _ in first })
         let ordered = Set(drag.sectionOrder)
         // Sections that appeared during the drag keep their place at the end.
@@ -160,7 +164,7 @@ where SectionModel.ID: Sendable, Item.ID: Sendable {
 
     private func rowSlots(of section: SectionModel) -> [RowSlot] {
         guard showsRows(of: section) else { return [] }
-        let rows = items(section)
+        let rows = displayedRows(of: section)
         guard let drag, case let .row(fromSection, rowID) = drag.item else {
             return rows.map { RowSlot.item(section.id, $0) }
         }
@@ -279,45 +283,45 @@ where SectionModel.ID: Sendable, Item.ID: Sendable {
 
     @ViewBuilder
     private func sectionMoveActions(for section: SectionModel) -> some View {
-        if let sectionMoveRequested, let index = sections.firstIndex(where: { $0.id == section.id }) {
+        if sectionMoveRequested != nil, let index = sections.firstIndex(where: { $0.id == section.id }) {
             if index > 0 {
                 Button("Move up") {
-                    sectionMoveRequested(.init(sources: [section.id], destination: .before(sections[index - 1].id)))
+                    request(.section(.init(sources: [section.id], destination: .before(sections[index - 1].id))))
                 }
-                .disabled(drag != nil)
+                .disabled(drag != nil || pending != nil)
             }
             if index + 1 < sections.count {
                 Button("Move down") {
                     let destination: SectionedListMove<SectionID>.Destination =
                         index + 2 < sections.count ? .before(sections[index + 2].id) : .end
-                    sectionMoveRequested(.init(sources: [section.id], destination: destination))
+                    request(.section(.init(sources: [section.id], destination: destination)))
                 }
-                .disabled(drag != nil)
+                .disabled(drag != nil || pending != nil)
             }
         }
     }
 
     @ViewBuilder
     private func rowMoveActions(for item: Item, in sectionID: SectionID) -> some View {
-        if let rowMoveRequested, canMoveRow(item),
+        if rowMoveRequested != nil, canMoveRow(item),
            let section = sections.first(where: { $0.id == sectionID }) {
             let movable = items(section).filter(canMoveRow)
             if let index = movable.firstIndex(where: { $0.id == item.id }) {
                 if index > 0 {
                     Button("Move up") {
-                        rowMoveRequested(.init(row: item.id, fromSection: sectionID, toSection: sectionID,
-                                               destination: .before(movable[index - 1].id)))
+                        request(.row(.init(row: item.id, fromSection: sectionID, toSection: sectionID,
+                                           destination: .before(movable[index - 1].id))))
                     }
-                    .disabled(drag != nil)
+                    .disabled(drag != nil || pending != nil)
                 }
                 if index + 1 < movable.count {
                     Button("Move down") {
                         let destination: SectionedListRowMove<SectionID, RowID>.Destination =
                             index + 2 < movable.count ? .before(movable[index + 2].id) : .end
-                        rowMoveRequested(.init(row: item.id, fromSection: sectionID, toSection: sectionID,
-                                               destination: destination))
+                        request(.row(.init(row: item.id, fromSection: sectionID, toSection: sectionID,
+                                           destination: destination)))
                     }
-                    .disabled(drag != nil)
+                    .disabled(drag != nil || pending != nil)
                 }
             }
         }
@@ -331,7 +335,8 @@ where SectionModel.ID: Sendable, Item.ID: Sendable {
     }
 
     private func hit(at point: CGPoint) -> Hit? {
-        guard drag == nil else { return nil }
+        // No new drag until the last move shows up in the caller's data.
+        guard drag == nil, pending == nil else { return nil }
         // Headers draw above rows (a pinned header covers rows), so they win.
         if let header = geometry.headers.first(where: { $0.value.contains(point) }) {
             return sectionMoveRequested == nil ? nil : .section(header.key, header.value)
@@ -384,13 +389,17 @@ where SectionModel.ID: Sendable, Item.ID: Sendable {
         }
     }
 
+    /// Turns a drop into a move request, worked out from the caller's current data: sections or rows
+    /// that changed during the drag are taken into account, and IDs that disappeared are skipped.
     private func requestMove(for drag: SectionedListDrag<SectionID, RowID>) {
         switch drag.item {
         case let .section(id):
-            let order = drag.sectionOrder
-            guard order != sections.map(\.id), let index = order.firstIndex(of: id) else { return }
+            let currentIDs = sections.map(\.id)
+            let existing = Set(currentIDs)
+            let order = drag.sectionOrder.filter { existing.contains($0) }
+            guard order != currentIDs, let index = order.firstIndex(of: id) else { return }
             let destination: SectionedListMove<SectionID>.Destination = index + 1 < order.count ? .before(order[index + 1]) : .end
-            sectionMoveRequested?(.init(sources: [id], destination: destination))
+            request(.section(.init(sources: [id], destination: destination)))
         case let .row(fromSection, rowID):
             guard let target = drag.rowTarget,
                   let section = sections.first(where: { $0.id == target.sectionID }) else { return }
@@ -400,7 +409,110 @@ where SectionModel.ID: Sendable, Item.ID: Sendable {
             // The destination is the next row that can move; rows that can't are never destinations.
             let before = remaining[min(target.index, remaining.count)...].first(where: canMoveRow)
             let destination: SectionedListRowMove<SectionID, RowID>.Destination = before.map { .before($0.id) } ?? .end
-            rowMoveRequested?(.init(row: rowID, fromSection: fromSection, toSection: section.id, destination: destination))
+            request(.row(.init(row: rowID, fromSection: fromSection, toSection: section.id, destination: destination)))
+        }
+    }
+
+    // MARK: Consistency with the caller's data
+
+    /// How long the list keeps showing a requested move that the caller's data hasn't caught up with.
+    private static var pendingDuration: Duration { .seconds(3) }
+
+    /// Sends a move to the caller and keeps showing its result until the caller's data shows it.
+    ///
+    /// The caller saves asynchronously, so its data still has the old order for a moment after a drop.
+    /// Showing that data would make the moved item jump back and then forward again. This is the role
+    /// of `NSFetchedResultsController`'s user-driven-update flag: the change the person made isn't
+    /// applied a second time when the data reports it. If the data never shows the move, because the
+    /// save failed or was refused, the list returns to the data after ``pendingDuration``.
+    /// The data is checked in ``dataChanged()``, when this view next receives the caller's data.
+    private func request(_ move: SectionedListPendingMove<SectionID, RowID>) {
+        pending = move
+        switch move {
+        case let .section(move): sectionMoveRequested?(move)
+        case let .row(move): rowMoveRequested?(move)
+        }
+        pendingTimeout?.cancel()
+        pendingTimeout = Task { @MainActor in
+            try? await Task.sleep(for: Self.pendingDuration)
+            guard !Task.isCancelled else { return }
+            withAnimation(.snappy(duration: 0.25)) { pending = nil }
+        }
+    }
+
+    /// The caller's sections, with a pending section move applied.
+    private var arrangedSections: [SectionModel] {
+        if case let .section(move)? = pending, let reordered = move.reordered(sections) {
+            return reordered
+        }
+        return sections
+    }
+
+    /// The caller's rows for a section, with a pending row move applied.
+    private func displayedRows(of section: SectionModel) -> [Item] {
+        let current = items(section)
+        guard case let .row(move)? = pending,
+              section.id == move.fromSection || section.id == move.toSection else { return current }
+        if section.id == move.fromSection, move.fromSection != move.toSection {
+            return current.filter { $0.id != move.row }
+        }
+        let source = sections.first(where: { $0.id == move.fromSection }).map(items) ?? []
+        guard let moved = (source + current).first(where: { $0.id == move.row }) else { return current }
+        var rows = current.filter { $0.id != move.row }
+        switch move.destination {
+        case let .before(id):
+            guard let index = rows.firstIndex(where: { $0.id == id }) else { return current }
+            rows.insert(moved, at: index)
+        case .end:
+            rows.append(moved)
+        }
+        return rows
+    }
+
+    /// The IDs in the caller's data, to notice when it changes.
+    private var dataSnapshot: SectionedListSnapshot<SectionID, RowID> {
+        SectionedListSnapshot(sectionIDs: sections.map(\.id), rowIDs: sections.map { items($0).map(\.id) })
+    }
+
+    private func dataChanged() {
+        if let pending, isShown(pending) {
+            pendingTimeout?.cancel()
+            pendingTimeout = nil
+            self.pending = nil
+        }
+        // The dragged item was deleted, or moved by someone else: there's nothing left to drop.
+        if drag != nil, !draggedItemExists {
+            withAnimation(.snappy(duration: 0.25)) { drag = nil }
+        }
+    }
+
+    /// Whether the caller's data already shows a pending move, or can no longer show it.
+    private func isShown(_ pending: SectionedListPendingMove<SectionID, RowID>) -> Bool {
+        switch pending {
+        case let .section(move):
+            // Nil when the move is already in place, or names a section that's gone.
+            return move.reordered(sections) == nil
+        case let .row(move):
+            guard let target = sections.first(where: { $0.id == move.toSection }) else { return true }
+            let targetIDs = items(target).map(\.id)
+            let inSource = sections.first(where: { $0.id == move.fromSection })
+                .map { items($0).contains { $0.id == move.row } } ?? false
+            let inTarget = targetIDs.contains(move.row)
+            if !inSource && !inTarget { return true }
+            if move.fromSection != move.toSection && inSource { return false }
+            // Nil when the row is already in place, or its destination row is gone.
+            return move.reordered(targetIDs) == nil
+        }
+    }
+
+    private var draggedItemExists: Bool {
+        switch drag?.item {
+        case nil:
+            return true
+        case let .section(id):
+            return sections.contains { $0.id == id }
+        case let .row(sectionID, rowID):
+            return sections.first(where: { $0.id == sectionID }).map { items($0).contains { $0.id == rowID } } ?? false
         }
     }
 
@@ -508,6 +620,18 @@ extension View {
 
 private enum SectionedListSpace {
     static let content = "SectionedList.content"
+}
+
+/// A move the list asked the caller to save, kept on screen until the caller's data shows it.
+private enum SectionedListPendingMove<SectionID: Hashable & Sendable, RowID: Hashable & Sendable>: Equatable {
+    case section(SectionedListMove<SectionID>)
+    case row(SectionedListRowMove<SectionID, RowID>)
+}
+
+/// The IDs in the caller's data, compared to notice changes.
+private struct SectionedListSnapshot<SectionID: Hashable, RowID: Hashable>: Equatable {
+    var sectionIDs: [SectionID]
+    var rowIDs: [[RowID]]
 }
 
 private struct SectionedListRowKey<SectionID: Hashable, RowID: Hashable>: Hashable {
