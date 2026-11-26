@@ -90,6 +90,75 @@ ListFox's `SLFSectionedListDemoView` is a complete in-memory example, and its Ho
 - Pass `nil` for a move handler whenever the shown sections or rows aren't the complete order (while
   searching or filtering), so a drop can't be computed against a partial list.
 
+## Staying consistent with SQLiteData
+
+The package assumes the data comes from a SQLite database managed by SQLiteData, saved asynchronously
+and observed with `@Fetch`/`@FetchAll`. It has no dependency on SQLiteData; the app follows these rules.
+
+**Why there's no "Invalid update: invalid number of rows in section".** That exception comes from
+`UITableView`/`UICollectionView` batch updates, where index-based inserts and deletes must add up to the
+data source's new counts. `NSFetchedResultsController` kept them in step by reporting a batch of changes
+between `controllerWillChangeContent` and `controllerDidChangeContent` (wrapped in
+`beginUpdates`/`endUpdates`), while the data source read from the controller itself; since iOS 13 it can
+deliver a diffable snapshot instead. This list has no index-based updates: SwiftUI compares whole
+snapshots by ID. Its equivalent rule is that IDs are unique and stable, which the list enforces for rows
+by keying them by section.
+
+The remaining risks, and who handles each:
+
+| Risk | `NSFetchedResultsController` equivalent | Handled by |
+|---|---|---|
+| A new result replaces the old one in the middle of main-thread work | Changes reported on the context's queue, once per `processPendingChanges()` | The app: observe on the main queue (below) |
+| The person's own move jumps back until the save lands, or is applied twice | The user-driven-update flag | The list |
+| A save computed from an older snapshot conflicts with changes saved since, such as an iCloud sync | Not applicable: edits went to the context directly | The app: save the intent (below) |
+| The dragged item is deleted or moved while it's lifted | Not applicable | The list |
+
+**1. Observe on the main queue.** By default, SQLiteData hands each new result over on GRDB's background
+queue, where Sharing stores it at once and notifies the main thread later. Two reads of the same fetched
+value in one reducer pass or view update can then see different data. Load with a main-queue scheduler
+so a new result lands only between pieces of main-thread work. GRDB's schedulers aren't `Hashable`,
+which `load(_:scheduler:)` requires, so define one:
+
+```swift
+struct MainQueueScheduler: ValueObservationScheduler, Hashable {
+    func immediateInitialValue() -> Bool { false }
+    func schedule(_ action: @escaping @Sendable () -> Void) {
+        DispatchQueue.main.async(execute: action)
+    }
+}
+
+try await $groups.load(Group.order(by: \.position), scheduler: MainQueueScheduler())
+```
+
+Loading with an `animation:` also delivers on the main queue. GRDB still coalesces: when several
+transactions commit quickly, you may get only the last result. That's fine for display, because each
+result is complete.
+
+**2. Save the intent, not the order.** Send "move X before Y" (or "to the end") to the database and work
+out the new order inside the write transaction, from the rows as they are then. A full order computed
+from the snapshot at drop time can be stale by the time the write runs. If Y no longer exists, place X
+at the end. One move is one write transaction.
+
+```swift
+try await database.write { db in
+    var ids = try Group.order(by: \.position).select(\.id).fetchAll(db).filter { $0 != movedID }
+    if let beforeID, let index = ids.firstIndex(of: beforeID) { ids.insert(movedID, at: index) }
+    else { ids.append(movedID) }
+    for (position, id) in ids.enumerated() {
+        try Group.find(id).update { $0.position = position }.execute(db)
+    }
+}
+```
+
+**3. What the list does.**
+- After a drop or a VoiceOver move, the list keeps showing the moved arrangement, applied on top of the
+  latest data, until the data shows the move. It then shows the data again with no visible change. If the
+  data doesn't show the move within 3 seconds, because the save failed or the app refused it, the list
+  returns to the data. No new drag can start meanwhile.
+- If the dragged item disappears from the data during a drag, the drag is cancelled. A drop is worked out
+  from the data current at that moment, skipping sections that disappeared.
+- Changes arriving during a drag, such as a sync, update the list underneath the lifted item.
+
 ## Options
 
 - **Collapsing.** Sections have a chevron only when `disclosureRequested` is supplied; otherwise all
@@ -120,7 +189,8 @@ headers with live feedback, and a draggable section swallows long presses on its
   that moves as neighbors slide apart. A dragged section collapses. Rows can go into empty sections and
   into collapsed ones, whose header highlights; they land at the end. The list can't scroll under the
   finger, and it auto-scrolls near the top and bottom edges. Haptics mark the lift and each new slot.
-- **On release.** The list reports one move request, or nothing if the item lands where it started.
+- **On release.** The list reports one move request, or nothing if the item lands where it started, and
+  keeps showing the result until the app's data catches up (see "Staying consistent with SQLiteData").
 
 ## Manual checks
 
@@ -135,7 +205,11 @@ Compiling proves nothing about gestures. On a device:
 4. Long-press a row: only the row lifts, and its button doesn't fire on release. Move it within its
    section, into another section, into an empty section, and onto a collapsed section's header.
 5. Drag near the top and bottom edges: the list auto-scrolls. Drop after scrolling far.
-6. Check VoiceOver (disclosure, header content, Move up/down on headers and rows, swipe actions), large
+6. After a drop, the item must stay where it was dropped while the save runs: no jump back and forward.
+   Make the app refuse a save, and the item must return to its old place after about 3 seconds.
+7. Delete or move the lifted item from another device while dragging (with iCloud sync on): the drag
+   must cancel without a crash.
+8. Check VoiceOver (disclosure, header content, Move up/down on headers and rows, swipe actions), large
    text, and both appearances in light and dark mode.
 
 ## Known limitations
