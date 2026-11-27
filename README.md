@@ -12,7 +12,7 @@ another one.
 ## Add it to an app
 
 ```swift
-.package(url: "https://github.com/reversecamber/SLFStickyDisclosure", exact: "0.1.0"),
+.package(url: "https://github.com/reversecamber/SLFStickyDisclosure", exact: "0.2.0"),
 ...
 .product(name: "SectionedListUI", package: "SLFStickyDisclosure"),
 ```
